@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>五子棋终极版 - 强力联机加固</title>
+    <!-- 使用更稳定的 CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        :root { --main: #2c3e50; --gold: #c6a306; --bg: #fdf6e3; --accent: #e67e22; }
+        * { touch-action: none; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg); display: flex; flex-direction: column; align-items: center; margin: 0; padding: 10px; min-height: 100vh; }
+        
+        .panel { background: white; padding: 12px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; margin-bottom: 10px; width: 100%; max-width: 500px; }
+        #status { font-weight: bold; color: #d35400; font-size: 1rem; }
+        #net-status { font-size: 0.75rem; color: #7f8c8d; margin-top: 3px; }
+        
+        .board-container { position: relative; width: 100%; max-width: 500px; aspect-ratio: 1/1; }
+        #board-canvas { background: #e3c18d; border: 4px solid #5d4037; border-radius: 4px; box-shadow: 0 8px 20px rgba(0,0,0,0.2); width: 100%; height: 100%; cursor: pointer; }
+
+        .controls { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 15px; width: 100%; max-width: 500px; }
+        button { padding: 12px 2px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; background: var(--main); color: white; font-size: 0.9rem; }
+        button:active { filter: brightness(1.2); transform: scale(0.95); }
+        .btn-ai { background: var(--accent); }
+        .btn-online { background: #27ae60; }
+        
+        .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 1000; align-items: center; justify-content: center; padding: 15px; }
+        .modal-body { background: white; padding: 20px; border-radius: 15px; width: 100%; max-width: 320px; text-align: center; }
+        #link-box { background: #f0f0f0; padding: 12px; border-radius: 8px; word-break: break-all; margin: 15px 0; font-size: 0.7rem; border: 1px dashed #999; }
+        
+        /* 准星标记 */
+        .last-move-marker { position: absolute; border: 2px solid red; border-radius: 50%; pointer-events: none; display: none; z-index: 5; }
+    </style>
+</head>
+<body>
+
+<div class="panel">
+    <div id="status">棋神已就位</div>
+    <div id="net-status">网络模块同步中...</div>
+</div>
+
+<div class="board-container">
+    <canvas id="board-canvas" width="600" height="600"></canvas>
+</div>
+
+<div class="controls">
+    <button class="btn-ai" onclick="game.startAI()">地狱 AI</button>
+    <button class="btn-online" onclick="game.openInvite()">好友对战</button>
+    <button onclick="game.reset()">重置局势</button>
+</div>
+
+<div id="modal" class="modal">
+    <div class="modal-body">
+        <h3 style="margin:0">邀请好友</h3>
+        <p style="font-size:0.8rem">复制链接发给好友。链接带#号，不要漏掉：</p>
+        <div id="link-box">正在获取专属加密通道...</div>
+        <button style="width:100%; background:#27ae60; color:white; padding:12px; border:none; border-radius:5px;" onclick="game.copyLink()">一键复制链接</button>
+        <button style="width:100%; margin-top:10px; background:#999; color:white; padding:8px; border:none; border-radius:5px;" onclick="game.closeModal()">取消</button>
+    </div>
+</div>
+
+<script>
+"use strict";
+
+const game = {
+    canvas: document.getElementById('board-canvas'),
+    ctx: document.getElementById('board-canvas').getContext('2d'),
+    ROWS: 15,
+    board: [],
+    turn: 1, 
+    isGameOver: false,
+    mode: 'local', 
+    myColor: 1,
+    lastMove: null,
+    peer: null,
+    conn: null,
+
+    init() {
+        this.board = Array(this.ROWS).fill().map(() => Array(this.ROWS).fill(0));
+        this.GRID = this.canvas.width / (this.ROWS + 1);
+        
+        const interaction = (e) => {
+            e.preventDefault();
+            if (this.isGameOver) return;
+            if (this.mode === 'ai' && this.turn !== 1) return;
+            if (this.mode === 'online' && this.turn !== this.myColor) return;
+
+            const rect = this.canvas.getBoundingClientRect();
+            const scale = 600 / rect.width;
+            const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+            const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+            const x = (clientX - rect.left) * scale;
+            const y = (clientY - rect.top) * scale;
+            
+            const c = Math.round(x / this.GRID) - 1;
+            const r = Math.round(y / this.GRID) - 1;
+            
+            if (r >= 0 && r < this.ROWS && c >= 0 && c < this.ROWS && !this.board[r][c]) {
+                this.executeMove(r, c);
+                if (this.mode === 'online' && this.conn) this.conn.send({type:'move', r, c});
+            }
+        };
+
+        this.canvas.addEventListener('pointerdown', interaction);
+        this.render();
+        this.startNetwork();
+    },
+
+    render() {
+        const ctx = this.ctx;
+        ctx.clearRect(0, 0, 600, 600);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        for(let i = 1; i <= this.ROWS; i++) {
+            ctx.beginPath();
+            ctx.moveTo(this.GRID, i * this.GRID); ctx.lineTo(600 - this.GRID, i * this.GRID);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(i * this.GRID, this.GRID); ctx.lineTo(i * this.GRID, 600 - this.GRID);
+            ctx.stroke();
+        }
+        for(let r = 0; r < this.ROWS; r++) {
+            for(let c = 0; c < this.ROWS; c++) {
+                if(this.board[r][c]) {
+                    const x = (c+1)*this.GRID, y = (r+1)*this.GRID;
+                    ctx.beginPath();
+                    ctx.arc(x, y, this.GRID*0.4, 0, Math.PI*2);
+                    const g = ctx.createRadialGradient(x-3, y-3, 2, x, y, this.GRID*0.4);
+                    if(this.board[r][c] === 1){ g.addColorStop(0,'#666'); g.addColorStop(1,'#000'); }
+                    else{ g.addColorStop(0,'#fff'); g.addColorStop(1,'#ccc'); }
+                    ctx.fillStyle = g; ctx.fill();
+                }
+            }
+        }
+        if(this.lastMove) {
+            ctx.strokeStyle = 'red'; ctx.lineWidth = 3;
+            ctx.strokeRect((this.lastMove.c+1)*this.GRID-8, (this.lastMove.r+1)*this.GRID-8, 16, 16);
+        }
+    },
+
+    executeMove(r, c) {
+        this.board[r][c] = this.turn;
+        this.lastMove = {r, c};
+        this.render();
+        if(this.checkWin(r, c, this.turn)) {
+            document.getElementById('status').innerText = (this.turn===1?"黑棋":"白棋") + " 胜！";
+            this.isGameOver = true;
+            return;
+        }
+        this.turn = 3 - this.turn;
+        this.updateUI();
+        if(this.mode === 'ai' && this.turn === 2) setTimeout(() => this.aiThink(), 100);
+    },
+
+    updateUI() {
+        const status = document.getElementById('status');
+        const p = this.turn === 1 ? "黑棋" : "白棋";
+        if (this.mode === 'online') {
+            status.innerText = (this.turn === this.myColor) ? `轮到你 (${p})` : `等待对手 (${p})`;
+        } else {
+            status.innerText = `轮到 ${p}`;
+        }
+    },
+
+    // ================= 职业级 AI =================
+    aiThink() {
+        const best = this.minimax(this.board, 4, -Infinity, Infinity, true);
+        if (best.move) this.executeMove(best.move.r, best.move.c);
+    },
+
+    minimax(board, depth, alpha, beta, isMax) {
+        if (depth === 0) return { score: this.evaluate(board) };
+        const candidates = this.getSmartCandidates(board);
+        let bestMove = candidates[0];
+        if (isMax) {
+            let maxScore = -Infinity;
+            for (let m of candidates) {
+                board[m.r][m.c] = 2;
+                if (this.checkWin(m.r, m.c, 2)) { board[m.r][m.c] = 0; return { score: 888888, move: m }; }
+                let s = this.minimax(board, depth-1, alpha, beta, false).score;
+                board[m.r][m.c] = 0;
+                if (s > maxScore) { maxScore = s; bestMove = m; }
+                alpha = Math.max(alpha, maxScore);
+                if (beta <= alpha) break;
+            }
+            return { score: maxScore, move: bestMove };
+        } else {
+            let minScore = Infinity;
+            for (let m of candidates) {
+                board[m.r][m.c] = 1;
+                if (this.checkWin(m.r, m.c, 1)) { board[m.r][m.c] = 0; return { score: -888888, move: m }; }
+                let s = this.minimax(board, depth-1, alpha, beta, true).score;
+                board[m.r][m.c] = 0;
+                if (s < minScore) { minScore = s; bestMove = m; }
+                beta = Math.min(beta, minScore);
+                if (beta <= alpha) break;
+            }
+            return { score: minScore, move: bestMove };
+        }
+    },
+
+    getSmartCandidates(board) {
+        const list = [];
+        for(let r=0; r<15; r++) for(let c=0; c<15; c++) {
+            if(board[r][c]) continue;
+            let near = false;
+            for(let i=-1; i<=1; i++) for(let j=-1; j<=1; j++) {
+                let nr=r+i, nc=c+j;
+                if(nr>=0&&nr<15&&nc>=0&&nc<15&&board[nr][nc]) near = true;
+            }
+            if(near || (r===7 && c===7)) list.push({r, c});
+        }
+        return list.slice(0, 20);
+    },
+
+    evaluate(board) {
+        return this.calc(board, 2) - this.calc(board, 1) * 2.5;
+    },
+
+    calc(board, p) {
+        let total = 0;
+        const dirs = [[1,0],[0,1],[1,1],[1,-1]];
+        for(let r=0;r<15;r++) for(let c=0;c<15;c++){
+            if(board[r][c]!==p) continue;
+            for(let [dr,dc] of dirs){
+                let s = "1";
+                for(let i=1;i<5;i++){
+                    let nr=r+dr*i, nc=c+dc*i;
+                    if(nr>=0&&nr<15&&nc>=0&&nc<15) s += (board[nr][nc]===p?'1':(board[nr][nc]===0?'0':'2'));
+                    else s += "2";
+                }
+                if(s.includes("11111")) total += 100000;
+                else if(s.includes("011110")) total += 10000;
+                else if(s.includes("01111") || s.includes("11110")) total += 5000;
+                else if(s.includes("01110")) total += 2000;
+            }
+        }
+        return total;
+    },
+
+    checkWin(r, c, p) {
+        const dirs = [[1,0],[0,1],[1,1],[1,-1]];
+        for(let [dr, dc] of dirs) {
+            let cnt = 1;
+            for(let i=1;i<5;i++){ let nr=r+dr*i,nc=c+dc*i; if(nr>=0&&nr<15&&nc>=0&&nc<15&&this.board[nr][nc]===p) cnt++; else break; }
+            for(let i=1;i<5;i++){ let nr=r-dr*i,nc=c-dc*i; if(nr>=0&&nr<15&&nc>=0&&nc<15&&this.board[nr][nc]===p) cnt++; else break; }
+            if(cnt>=5) return true;
+        }
+        return false;
+    },
+
+    // ================= 核心网络增强逻辑 =================
+    startNetwork() {
+        const config = {
+            config: {
+                'iceServers': [
+                    { 'urls': 'stun:stun.l.google.com:19302' },
+                    { 'urls': 'stun:stun1.l.google.com:19302' },
+                    { 'urls': 'stun:stun2.l.google.com:19302' }
+                ]
+            }
+        };
+
+        const checkPeer = setInterval(() => {
+            if (window.Peer) {
+                clearInterval(checkPeer);
+                this.peer = new Peer(config);
+                
+                this.peer.on('open', (id) => {
+                    document.getElementById('net-status').innerText = "服务器已就绪";
+                    this.checkJoin(id);
+                });
+
+                this.peer.on('connection', (c) => {
+                    this.conn = c;
+                    this.myColor = 1;
+                    this.setupConn('host');
+                });
+
+                this.peer.on('error', (err) => {
+                    console.error(err);
+                    document.getElementById('net-status').innerText = "网络连接异常: " + err.type;
+                });
+            }
+        }, 500);
+    },
+
+    checkJoin(myId) {
+        const targetId = window.location.hash.substring(1);
+        if (targetId && targetId !== myId) {
+            document.getElementById('net-status').innerText = "正在握手连接...";
+            this.conn = this.peer.connect(targetId, { reliable: true });
+            this.myColor = 2;
+            this.setupConn('guest');
+        }
+    },
+
+    setupConn(role) {
+        this.conn.on('open', () => {
+            this.mode = 'online';
+            // 发送握手信号，确保双方重置
+            this.conn.send({ type: 'handshake' });
+        });
+
+        this.conn.on('data', (data) => {
+            if (data.type === 'move') this.executeMove(data.r, data.c);
+            if (data.type === 'handshake') {
+                this.resetBoardData();
+                document.getElementById('net-status').innerText = "联机成功！实时同步中";
+                this.closeModal();
+                if (role === 'guest') alert("成功连接！房主黑棋先手。");
+            }
+        });
+
+        this.conn.on('close', () => {
+            document.getElementById('net-status').innerText = "对方已断开";
+            alert("对局结束：对方离开了");
+            this.mode = 'local';
+        });
+    },
+
+    openInvite() {
+        if (!this.peer || !this.peer.id) return alert("网络组件载入中，请稍等");
+        document.getElementById('modal').style.display = 'flex';
+        const url = window.location.origin + window.location.pathname + '#' + this.peer.id;
+        document.getElementById('link-box').innerText = url;
+    },
+
+    copyLink() {
+        const link = document.getElementById('link-box').innerText;
+        const temp = document.createElement('textarea');
+        temp.value = link;
+        document.body.appendChild(temp);
+        temp.select();
+        document.execCommand('copy');
+        document.body.removeChild(temp);
+        alert("邀请链接已复制！请发给好友");
+    },
+
+    resetBoardData() {
+        this.board = Array(15).fill().map(() => Array(15).fill(0));
+        this.isGameOver = false; this.turn = 1; this.lastMove = null;
+        this.render(); this.updateUI();
+    },
+
+    startAI() { this.resetBoardData(); this.mode = 'ai'; document.getElementById('status').innerText = "挑战地狱 AI"; },
+    reset() { this.resetBoardData(); this.mode = 'local'; document.getElementById('status').innerText = "单机模式"; },
+    closeModal() { document.getElementById('modal').style.display = 'none'; }
+};
+
+game.init();
+</script>
+</body>
+</html>
